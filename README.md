@@ -62,23 +62,4 @@ Implication: int64 fast-path accelerates many operations but risks overflow for 
 - Random lattices or worst-case lattices where an exact/pruned enumeration is needed to find the shortest vector.
 - Large-scale runs where performance matters (compiled code is many times faster).
 
-## How to make results comparable / recommendations
-
-1. Implement orthogonal block projection (GS) before calling the oracle in `bkz.py`.
-2. Use the same block sizes and number of tours for both implementations when benchmarking.
-3. Use reproducible seeds and run multiple trials; report success rates and timings.
-4. If you want speed with good block-SVP quality, call `fpylll` for the block oracle when it is available (this repo provides plumbing for that in `bkz.py`).
-5. For production performance of geometric methods, move hot inner loops to numba/Cython (this project already has safe int64 fast-paths and optional numba hooks).
-
-## Reproducibility / commands
-
-- Unit tests: `python3 test_bkz.py`
-- Random-basis benchmark: `python3 benchmark_bkz.py`
-- Planted lattice benchmark: `python3 benchmark_planted.py`
-- Multi-trial sweep (planted): `python3 benchmark_planted_runner.py`
-
-## Final notes
-
-This repository is an experimental exploration of geometric heuristics for lattice reduction. The geometric oracle is intentionally different from standard BKZ — that is the point — but differences must be understood when interpreting benchmarks. If you want a fair, apples-to-apples comparison, I recommend enabling block projection and optionally wiring the standard SVP oracle (fpylll) as a baseline.
-
 If you want, I can add a short script that enforces projected-block BKZ for both oracles and runs side-by-side comparisons with consistent parameters.
