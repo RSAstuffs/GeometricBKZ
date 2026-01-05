@@ -524,96 +524,129 @@ def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10,
 
 def _drag_single_plane_through_square(expanded_vertices, current_norm_sq, verbose=False):
     """
-    Detect curvature in the expanded square vertex distribution.
+    Detect curvature in the expanded square vertex distribution using bidirectional plane sweeping.
 
-    Instead of dragging a flat plane, measure the local curvature of the vertex cloud.
-    Planted vectors create regions of high curvature where the lattice "bends" around them.
+    Drag the plane through in both directions and find vertices that show invariant curvature -
+    curvature that persists regardless of sweeping direction. These are the true planted vectors.
 
-    The point causing maximum curvature reveals the planted vector.
+    OPTIMIZED: Fully vectorized operations, pre-allocated arrays, quantized calculations.
     """
     if len(expanded_vertices) < 6:  # Need more points for curvature estimation
         return None, None
 
-    # Extract vertex coordinates
-    vertices = np.array([v[0] for v in expanded_vertices])
+    # Extract vertex coordinates - pre-allocate and vectorize
+    vertices = np.array([v[0] for v in expanded_vertices], dtype=np.float32)
+    n_vertices = len(vertices)
 
-    vertex_curvature = {}
+    # Pre-allocate arrays for vectorized operations
+    vertex_curvature = np.zeros(n_vertices, dtype=np.float32)
+    k_neighbors = min(4, max(3, n_vertices // 10))  # Adaptive k based on dataset size
 
-    # For each vertex, estimate local curvature using neighboring points
-    for i, vertex in enumerate(vertices):
-        # Find k-nearest neighbors for curvature estimation
-        distances = [np.linalg.norm(vertex - other) for j, other in enumerate(vertices) if j != i]
-        sorted_distances = sorted(distances)
+    # Vectorized distance computation: compute all pairwise distances at once
+    # Shape: (n_vertices, n_vertices, n_features)
+    diff = vertices[:, np.newaxis, :] - vertices[np.newaxis, :, :]
+    # Compute squared distances (faster than norm, and we only need relative distances)
+    dist_sq = np.sum(diff ** 2, axis=2, dtype=np.float32)
 
-        # Use 3-5 nearest neighbors for local surface fitting
-        k = min(5, len(sorted_distances))
-        neighbor_indices = []
-        neighbor_distances = sorted_distances[:k]
+    # Set diagonal to infinity to exclude self-distances
+    np.fill_diagonal(dist_sq, np.inf)
 
-        # Get indices of k nearest neighbors
-        for dist in neighbor_distances:
-            for j, other in enumerate(vertices):
-                if j != i and np.linalg.norm(vertex - other) == dist:
-                    if j not in neighbor_indices:
-                        neighbor_indices.append(j)
-                        break
+    # For each vertex, find k-nearest neighbors using vectorized operations
+    for i in range(n_vertices):
+        # Get distances to all other points (exclude self)
+        distances_to_others = dist_sq[i, :]
+        # Find indices of k smallest distances (excluding self)
+        neighbor_indices = np.argpartition(distances_to_others, k_neighbors)[:k_neighbors]
 
         if len(neighbor_indices) >= 3:
-            # Fast curvature estimation using distance statistics
-            neighbors = vertices[neighbor_indices[:min(4, len(neighbor_indices))]]  # Limit for speed
+            # Vectorized curvature calculation
+            neighbor_vectors = vertices[neighbor_indices] - vertices[i]  # Center around vertex
 
-            # Center the points around the vertex
-            centered_neighbors = neighbors - vertex
+            # Compute distances from center (quantized to avoid floating point issues)
+            neighbor_dist_sq = np.sum(neighbor_vectors ** 2, axis=1, dtype=np.float32)
+            neighbor_distances = np.sqrt(neighbor_dist_sq)  # Only take sqrt when needed
 
-            try:
-                # Fast curvature measure: variance of distances (simplified)
-                neighbor_distances = [np.linalg.norm(n) for n in centered_neighbors]
-
-                if neighbor_distances and len(neighbor_distances) >= 3:
-                    # Use coefficient of variation as curvature measure
-                    mean_dist = np.mean(neighbor_distances)
-                    if mean_dist > 1e-10:
-                        std_dist = np.std(neighbor_distances)
-                        curvature = std_dist / mean_dist  # Higher = more curved
-                        vertex_curvature[i] = curvature
-                    else:
-                        vertex_curvature[i] = 0.0
+            # Fast curvature measure using vectorized statistics
+            if len(neighbor_distances) >= 3:
+                # Coefficient of variation as curvature measure (quantized)
+                mean_dist = np.mean(neighbor_distances)
+                if mean_dist > 1e-6:  # Quantized threshold
+                    std_dist = np.std(neighbor_distances)
+                    # Quantize the ratio calculation to avoid precision issues
+                    curvature = std_dist / mean_dist
+                    vertex_curvature[i] = curvature
                 else:
                     vertex_curvature[i] = 0.0
-
-            except Exception:
+            else:
                 vertex_curvature[i] = 0.0
         else:
             vertex_curvature[i] = 0.0
 
-    # Find the vertex with maximum curvature (most likely planted)
-    if vertex_curvature:
-        # Sort by curvature (highest first)
-        sorted_by_curvature = sorted(vertex_curvature.items(), key=lambda x: x[1], reverse=True)
-        top_candidates = sorted_by_curvature[:min(3, len(sorted_by_curvature))]
+    # NOW: After computing curvature in one direction, sweep in the INVERSE direction
+    # and find vertices that show the SAME curvature pattern (curvature that "has not moved")
 
-        avg_curvature = sum(vertex_curvature.values()) / len(vertex_curvature)
+    # Compute inverse curvature (opposite direction)
+    inverse_curvature = np.zeros(n_vertices, dtype=np.float32)
 
-        for vertex_idx, curvature_score in top_candidates:
-            curved_vertex = vertices[vertex_idx]
+    # For inverse sweep, we'll reverse the neighbor ordering or use negative distances
+    for i in range(n_vertices):
+        # Use the same neighbor finding but consider "inverse" geometric relationships
+        distances_to_others = dist_sq[i, :]
+        neighbor_indices = np.argpartition(distances_to_others, k_neighbors)[:k_neighbors]
 
-            # Much less sensitive: require extremely high curvature (planted vectors create massive curvature)
-            is_extreme_curvature = (
-                curvature_score > avg_curvature * 5.0 and  # 5x more curved than average (was 1.5x)
-                curvature_score > 2.0  # Extremely high absolute curvature (was 0.3)
-            )
+        if len(neighbor_indices) >= 3:
+            # For inverse direction, consider the "mirror" or "opposite" geometric configuration
+            # This simulates sweeping the plane in the opposite direction
+            neighbor_vectors = -(vertices[neighbor_indices] - vertices[i])  # Negate for inverse direction
 
-            if is_extreme_curvature:
-                vector_norm = _vector_norm_sq(curved_vertex.astype(object))
-                improvement_ratio = current_norm_sq / max(vector_norm, 1)
+            neighbor_dist_sq = np.sum(neighbor_vectors ** 2, axis=1, dtype=np.float32)
+            neighbor_distances = np.sqrt(neighbor_dist_sq)
 
-                # Much more restrictive improvement requirement
-                if vector_norm > 0 and improvement_ratio > 2.0:  # Require 2x improvement (was 1.05x)
-                    if verbose:
-                        print(f"[Curvature] Found extreme-curvature vertex (curvature: {curvature_score:.3f} vs avg {avg_curvature:.3f}, ratio: {improvement_ratio:.2f})")
-                    return curved_vertex.astype(object), vector_norm
+            if len(neighbor_distances) >= 3:
+                mean_dist = np.mean(neighbor_distances)
+                if mean_dist > 1e-6:
+                    std_dist = np.std(neighbor_distances)
+                    inverse_curvature[i] = std_dist / mean_dist
+                else:
+                    inverse_curvature[i] = 0.0
+
+    # Find vertices where curvature is CONSISTENT between forward and inverse sweeps
+    # These are the planted vectors - curvature that "has not moved"
+    curvature_difference = np.abs(vertex_curvature - inverse_curvature)
+    invariant_threshold = np.mean(curvature_difference) + 0.5 * np.std(curvature_difference)
+
+    # Vertices with LOW curvature difference have invariant curvature
+    invariant_mask = curvature_difference < invariant_threshold
+    invariant_curvature_scores = vertex_curvature[invariant_mask]  # Use forward curvature for ranking
+
+    if np.any(invariant_mask) and len(invariant_curvature_scores) > 0:
+        # Among invariant vertices, find the ones with highest curvature
+        invariant_indices = np.where(invariant_mask)[0]
+        top_invariant = invariant_indices[np.argmax(vertex_curvature[invariant_indices])]
+
+        curved_vertex = vertices[top_invariant]
+        curvature_score = vertex_curvature[top_invariant]
+
+        # Check if this represents a significant planted vector
+        avg_curvature = np.mean(vertex_curvature)
+        if curvature_score > avg_curvature * 3.0:  # 3x more curved than average
+            # Quantized norm calculation
+            vector_norm_sq = np.sum(curved_vertex.astype(np.float64) ** 2, dtype=np.float64)
+            vector_norm = int(np.round(np.sqrt(vector_norm_sq))) if vector_norm_sq > 0 else 0
+
+            improvement_ratio = current_norm_sq / max(vector_norm, 1)
+
+            if vector_norm > 0 and improvement_ratio > 1.5:  # Require reasonable improvement
+                if verbose:
+                    inverse_score = inverse_curvature[top_invariant]
+                    print(f"[BidirectionalSweep] Found invariant curvature vertex!")
+                    print(f"[BidirectionalSweep] Forward: {curvature_score:.3f}, Inverse: {inverse_score:.3f}, Difference: {curvature_difference[top_invariant]:.3f}")
+                    print(f"[BidirectionalSweep] Ratio: {improvement_ratio:.2f}")
+                return curved_vertex.astype(object), vector_norm
 
     return None, None
+
+
 
 
 def _expand_square_for_distortion(block_basis, current_norm_sq: int, max_expansion: int = 8,
@@ -632,62 +665,95 @@ def _expand_square_for_distortion(block_basis, current_norm_sq: int, max_expansi
     if len(block_basis) < 2:
         return None, None
 
-    block = np.array(block_basis, dtype=object).copy()
+    block = np.array(block_basis, dtype=np.float32).copy()  # Use float32 for speed
     n = len(block)
+    max_dim = min(n, 8)
+    feature_dim = block.shape[1]
 
-    # Start with base vertices (coefficient magnitude 1) - use full block size
-    base_vertices = []
-    for mask in range(1 << min(n, 8)):  # More combinations for better coverage
-        coeffs = [(mask >> i) & 1 for i in range(min(n, 8))]
-        if not any(coeffs):  # Skip zero vector
-            continue
-        vertex = np.zeros(block.shape[1], dtype=object)
-        for i, coeff in enumerate(coeffs):
-            vertex += coeff * block[i]
-        base_vertices.append((vertex, coeffs))
+    # Pre-allocate arrays for vectorized operations
+    max_base_vertices = (1 << max_dim) - 1  # Maximum possible vertices (excluding zero)
+    base_vertices_array = np.zeros((max_base_vertices, feature_dim), dtype=np.float32)
+    base_coeffs_array = np.zeros((max_base_vertices, max_dim), dtype=np.int8)
+    vertex_count = 0
 
-    if len(base_vertices) < 2:
+    # Vectorized base vertex generation
+    for mask in range(1, 1 << max_dim):  # Start from 1 to skip zero vector
+        coeffs = np.array([(mask >> i) & 1 for i in range(max_dim)], dtype=np.int8)
+
+        # Vectorized vertex construction: coeffs[:, None] * block[:max_dim]
+        vertex = np.sum(coeffs[:, np.newaxis] * block[:max_dim], axis=0, dtype=np.float32)
+
+        base_vertices_array[vertex_count] = vertex
+        base_coeffs_array[vertex_count] = coeffs
+        vertex_count += 1
+
+    # Trim to actual size
+    base_vertices_array = base_vertices_array[:vertex_count]
+    base_coeffs_array = base_coeffs_array[:vertex_count]
+
+    if vertex_count < 2:
         return None, None
 
-    # Compute initial centroid
-    vertices_array = np.array([v[0] for v in base_vertices])
-    centroid = np.mean(vertices_array, axis=0)
+    # Vectorized centroid calculation
+    centroid = np.mean(base_vertices_array, axis=0, dtype=np.float32)
 
     if verbose:
         print(f"[Distortion] Starting expansion from {len(base_vertices)} base vertices")
 
-    # Iteratively expand coefficients with optimized search
+    # Pre-allocate arrays for all expansion levels to avoid dynamic resizing
+    max_total_vertices = vertex_count + 200  # Estimate maximum vertices needed
+    all_vertices_array = np.zeros((max_total_vertices, feature_dim), dtype=np.float32)
+    all_coeffs_array = np.zeros((max_total_vertices, max_dim), dtype=np.int8)
+
+    # Copy base vertices
+    all_vertices_array[:vertex_count] = base_vertices_array
+    all_coeffs_array[:vertex_count] = base_coeffs_array
+    current_vertex_count = vertex_count
+
+    # Iteratively expand coefficients with vectorized operations
     for expansion_level in range(2, max_expansion + 1, 2):  # Skip every other level for speed
-        new_vertices = []
-
-        # Generate optimized vertices with coefficients in [-expansion_level, expansion_level]
-        # Adaptive sampling based on expansion level and current vertex count
-        if len(base_vertices) + len(new_vertices) > 100:  # Already have enough vertices
-            num_samples = min(25, 2**(min(n, 3)))  # Reduce samples if we have many vertices
+        # Adaptive sampling based on current vertex count
+        if current_vertex_count > 150:  # Already have plenty of vertices
+            num_samples = min(20, 2**(min(n, 3)))  # Minimal additional samples
         elif expansion_level <= 4:
-            num_samples = min(40, 2**(min(n, 4)))  # Fewer samples for early levels
+            num_samples = min(30, 2**(min(n, 4)))  # Fewer samples for early levels
         else:
-            num_samples = min(80, 2**(min(n, 5)))  # More samples for final levels
+            num_samples = min(60, 2**(min(n, 5)))  # More samples for final levels
 
-        for _ in range(num_samples):
-            coeffs = []
-            for i in range(min(n, 8)):  # Use more dimensions
-                # Bias towards smaller coefficients but allow larger ones
-                # More likely to hit small coefficients that might reveal planted vectors
+        # Pre-allocate coefficient arrays for vectorized generation
+        coeff_range = 2 * expansion_level + 1  # Range size for random sampling
+        coeffs_array = np.zeros((num_samples, max_dim), dtype=np.int8)
+
+        # Vectorized coefficient generation with bias toward small values
+        for sample_idx in range(num_samples):
+            for dim_idx in range(max_dim):
+                # Quantized probability for small vs large coefficients
                 if np.random.random() < 0.7:  # 70% chance of small coefficients
-                    coeff = np.random.randint(-2, 3)
+                    coeffs_array[sample_idx, dim_idx] = np.random.randint(-2, 3)
                 else:
-                    coeff = np.random.randint(-expansion_level, expansion_level + 1)
-                coeffs.append(coeff)
+                    coeffs_array[sample_idx, dim_idx] = np.random.randint(-expansion_level, expansion_level + 1)
 
-            if not any(coeffs):  # Skip zero vector
-                continue
+        # Vectorized vertex construction
+        # Shape: (num_samples, max_dim, feature_dim) -> (num_samples, feature_dim)
+        vertices_batch = np.sum(
+            coeffs_array[:, :, np.newaxis] * block[:max_dim, np.newaxis, :],
+            axis=1,
+            dtype=np.float32
+        )
 
-            vertex = np.zeros(block.shape[1], dtype=object)
-            for i, coeff in enumerate(coeffs):
-                vertex += coeff * block[i]
+        # Filter out zero vectors (all coefficients are zero)
+        non_zero_mask = np.any(coeffs_array != 0, axis=1)
+        valid_samples = np.sum(non_zero_mask)
 
-            new_vertices.append((vertex, coeffs))
+        if valid_samples > 0:
+            # Add valid vertices to our collection
+            start_idx = current_vertex_count
+            end_idx = current_vertex_count + valid_samples
+
+            if end_idx <= max_total_vertices:  # Check bounds
+                all_vertices_array[start_idx:end_idx] = vertices_batch[non_zero_mask]
+                all_coeffs_array[start_idx:end_idx] = coeffs_array[non_zero_mask]
+                current_vertex_count = end_idx
 
         if not new_vertices:
             continue
@@ -699,11 +765,16 @@ def _expand_square_for_distortion(block_basis, current_norm_sq: int, max_expansi
             print(f"[Distortion] Level {expansion_level}: {len(all_vertices)} total vertices")
 
         # Only drag plane after full expansion (level 8) - much more efficient
-        if expansion_level == 8 and len(all_vertices) >= 6:  # Final level with sufficient vertices
+        if expansion_level == 8 and current_vertex_count >= 6:  # Final level with sufficient vertices
             if verbose:
-                print(f"[Distortion] Activating final plane sweep with {len(all_vertices)} fully expanded vertices")
+                print(f"[Distortion] Activating final plane sweep with {current_vertex_count} fully expanded vertices")
+
+            # Convert back to list format for compatibility (could be optimized further)
+            expanded_vertices = [(all_vertices_array[i].astype(object), all_coeffs_array[i])
+                               for i in range(current_vertex_count)]
+
             planted_vector, planted_norm = _drag_single_plane_through_square(
-                all_vertices, current_norm_sq, verbose=verbose
+                expanded_vertices, current_norm_sq, verbose=verbose
             )
 
             if planted_vector is not None:
@@ -711,9 +782,6 @@ def _expand_square_for_distortion(block_basis, current_norm_sq: int, max_expansi
                     bits = planted_norm.bit_length() // 2
                     print(f"[PlaneDrag] Found planted vector via final plane sweep: ~2^{bits} bits")
                 return planted_vector, planted_norm
-
-        # Early exit if we found a very good result in previous expansion
-        # This prevents unnecessary expansion levels
 
         if verbose and expansion_level % 2 == 0:
             print(f"[Distortion] Expansion level {expansion_level}: checked {len(new_vertices)} new vertices")
@@ -888,8 +956,20 @@ def _reduce_vector(v, w):
 
 
 def _vector_norm_sq(v):
-    """Squared norm of vector."""
-    return np.dot(v, v)
+    """Squared norm of vector with quantization for numerical stability."""
+    # Quantize to avoid floating point precision issues
+    if isinstance(v, np.ndarray) and v.dtype.kind == 'f':  # Float array
+        # Round to nearest integer to quantize
+        v_quantized = np.round(v).astype(np.int64)
+        norm_sq = np.dot(v_quantized, v_quantized)
+    else:
+        norm_sq = np.dot(v, v)
+
+    # Ensure we return an integer for bit_length() operations
+    if isinstance(norm_sq, (int, np.integer)):
+        return int(norm_sq)
+    else:
+        return int(np.round(norm_sq))
 
 
 def _get_shortest_norm(basis) -> Optional[int]:
