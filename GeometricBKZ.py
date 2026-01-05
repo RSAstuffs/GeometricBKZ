@@ -202,8 +202,10 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
     candidate_ranges = []
     
     if triangles is not None:
-        # 3. Score triangles and compute centroids for next point placement
-        triangle_scores = []
+        # 3. Score triangles and vertices for next point placement
+        candidate_scores = []
+        
+        # Score triangles
         for simplex in triangles:
             # Triangle vertices
             tri_verts = vertices[simplex]
@@ -237,14 +239,39 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
             
             # Score: prefer larger areas and more spread indices
             score = area * len(indices)
-            triangle_scores.append((score, indices, closest_idx))
+            candidate_scores.append((score, indices, closest_idx, 'triangle'))
         
-        # Sort by score descending
-        triangle_scores.sort(reverse=True)
+        # Score vertices (square corners) as additional candidates
+        for v_idx, vertex in enumerate(vertices):
+            # Use vertex position as centroid
+            centroid = vertex[:2]  # 2D projection
+            
+            # Find closest basis vector to vertex
+            min_dist = float('inf')
+            closest_idx = -1
+            for i in range(n):
+                basis_proj = np.array([basis[i][0], basis[i][1]], dtype=float)
+                dist = np.linalg.norm(basis_proj - centroid)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = i
+            
+            # Get indices from this vertex
+            indices = sorted(list(vertex_indices[v_idx]))
+            if len(indices) < 2:
+                continue
+            
+            # Score vertices by their "importance" (number of contributing indices)
+            # Give vertices slightly lower priority than triangles by scaling score
+            score = 0.8 * len(indices)  # Scale down to prefer triangles but still consider vertices
+            candidate_scores.append((score, indices, closest_idx, 'vertex'))
+        
+        # Sort all candidates by score descending
+        candidate_scores.sort(reverse=True)
         
         # 4. Map to contiguous ranges, prioritizing those containing centroid indices
         prioritized_ranges = []
-        for score, indices, centroid_idx in triangle_scores[:max_candidates]:
+        for score, indices, centroid_idx, source in candidate_scores[:max_candidates]:
             # Find contiguous segments
             indices.sort()
             start = indices[0]
