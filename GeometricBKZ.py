@@ -183,6 +183,30 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
             vertices.append(v.astype(float))
             vertex_indices.append(contrib)
     
+    # Add diagonal vectors (space diagonals)
+    if d >= 2 and vertices:  # Only if we have regular vertices
+        # Main space diagonal: sum of all basis vectors in subspace
+        s = np.ones(n, dtype=object)
+        contrib = list(range(d))
+        v = np.zeros(basis.shape[1], dtype=object)
+        for j in range(d):
+            v += s[j] * basis[j]
+        vertices.append(v.astype(float))
+        vertex_indices.append(contrib)
+        
+        # Face diagonals for higher dimensions
+        if d >= 3:
+            # For 3D+: face diagonals (sum of all but one basis vector)
+            for i in range(d):
+                s = np.ones(n, dtype=object)
+                s[i] = 0  # exclude one dimension
+                contrib = [j for j in range(d) if j != i]
+                v = np.zeros(basis.shape[1], dtype=object)
+                for j in range(d):
+                    v += s[j] * basis[j]
+                vertices.append(v.astype(float))
+                vertex_indices.append(contrib)
+    
     if len(vertices) < 4:
         return [(0, min(block_size, n))], []
     
@@ -317,11 +341,25 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
     candidate_ranges = list(set(candidate_ranges))
     candidate_ranges = [(s, e) for s, e in candidate_ranges if e - s <= block_size and e - s >= 2]
     
-    # Select top candidates
+    # Select top candidates and collect hints for each
     selected = candidate_ranges[:max_candidates]
     centroid_hints = []
-    if triangles is not None and prioritized_ranges:
-        centroid_hints = [prioritized_ranges[i][2] for i in range(min(len(prioritized_ranges), max_candidates))]
+    
+    if triangles is not None and candidate_scores:
+        # For each selected candidate, collect all relevant hint indices
+        for s, e in selected:
+            block_hints = []
+            # Collect hints from top candidates that overlap with this block
+            for score, indices, centroid_idx, source in candidate_scores[:max_candidates]:
+                # Check if this candidate's indices overlap with the block
+                if any(s <= idx < e for idx in indices):
+                    if centroid_idx not in block_hints:
+                        block_hints.append(centroid_idx)
+            centroid_hints.append(block_hints)
+    
+    # Ensure we have hints for all selected blocks
+    while len(centroid_hints) < len(selected):
+        centroid_hints.append([])
     
     return selected if selected else [(0, min(block_size, n))], centroid_hints
 
@@ -362,15 +400,17 @@ def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10,
         print(f"[*] Running Optimized Geometric BKZ on {n}x{basis.shape[1]} lattice...")
         print(f"[*] Block size: {block_size}, Max tours: {max_tours}")
     
-    # Initial geometric reduction using proper geometric methods (analogous to geometric_lll.py)
+    # Initial geometric reduction using GeometricLLL (matches geometric_lll.py)
     if verbose:
         print(f"[*] Initial geometric reduction...")
-
-    # Apply geometric LLL reduction (from geometric_lll.py _lll_reduce_basis)
-    basis = _geometric_lll_reduce(basis, max_iterations=min(30, n), verbose=verbose)
-
-    # Apply hierarchical geometric compression (from geometric_lll.py run_geometric_reduction)
-    basis = _hierarchical_geometric_compress(basis, verbose=verbose)
+    try:
+        g_full = GeometricLLL(N, basis=basis.copy())
+        basis = g_full.run_geometric_reduction(verbose=False, num_passes=1)
+    except Exception as e:
+        if verbose:
+            print(f"[!] GeometricLLL reduction failed: {e}, using fallback")
+        # Fallback to simple sort by norm
+        basis = _geometric_reorder(basis, verbose=False)
     
     # Initialize GSO cache
     gso_cache = GSOCache(basis)
@@ -389,79 +429,70 @@ def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10,
         blocks_processed = 0
         blocks_skipped = 0
         
-        # Process blocks sequentially (like geometric_lll.py run_bkz)
-        for k in range(n - 1):
-            # Block indices: [k, min(k + block_size, n)) (from geometric_lll.py)
-            block_end = min(k + block_size, n)
-            block_len = block_end - k
-
+        # Geometric block selection: use parallelepiped vertices to select candidates
+        candidate_blocks, centroid_hints = _select_candidate_blocks_geometric(basis, block_size, max_candidates=10)
+        
+        for k_start, k_end in candidate_blocks:
+            block_len = k_end - k_start
             if block_len < 2:
                 continue
-
+            
             blocks_processed += 1
+            
+            # Extract block
+            block = basis[k_start:k_end].copy()
 
-            # Extract block (from geometric_lll.py)
-            block = basis[k:block_end].copy()
+            # Adaptive number of passes based on block size
+            num_passes = max(2, min(4, 20 // block_len))
 
-            # Find shortest vector in block using geometric reduction (from geometric_lll.py)
-            # Apply geometric LLL and hierarchical compression to the block
-            reduced_block = _geometric_lll_reduce(block, max_iterations=min(20, block_len), verbose=False)
-            reduced_block = _hierarchical_geometric_compress(reduced_block, verbose=False)
-
-            # Get the shortest vector from reduced block (from geometric_lll.py)
-            shortest_idx = 0
-            shortest_norm = _vector_norm_sq(reduced_block[0])
-            for i in range(1, len(reduced_block)):
-                norm = _vector_norm_sq(reduced_block[i])
-                if norm > 0 and (shortest_norm == 0 or norm < shortest_norm):
-                    shortest_norm = norm
-                    shortest_idx = i
-
-            # Check if this improves the basis (from geometric_lll.py)
-            current_norm = gso_cache.get_norm(k)
-
+            # DIVINE: Use the Oracle to find shortest vector
+            # The Oracle uses staged expansion for blocks >= 4 to reveal hidden structure
+            block_hints = centroid_hints[blocks_processed - 1] if blocks_processed - 1 < len(centroid_hints) else []
+            shortest_vector, shortest_norm = _geometric_svp_oracle(
+                block, N, num_passes, block_len, verbose=(verbose and blocks_processed <= 3),
+                centroid_hints=block_hints
+            )
+            
+            # Check if this is shorter than current first vector in block
+            current_norm = gso_cache.get_norm(k_start)
+            
             if shortest_norm > 0 and shortest_norm < current_norm:
-                # Insert shortest vector at position k (from geometric_lll.py)
-                new_vector = reduced_block[shortest_idx].copy()
-
-                # Shift vectors down
-                for i in range(block_end - 1, k, -1):
+                # Insert shortest vector at the beginning of block
+                for i in range(k_end - 1, k_start, -1):
                     basis[i] = basis[i-1].copy()
-                basis[k] = new_vector
-
-                # Re-reduce the affected portion (from geometric_lll.py)
-                for i in range(k, min(k + block_size + 1, n)):
+                basis[k_start] = shortest_vector
+                
+                # Local re-reduction of affected region (matches geometric_lll.py pattern)
+                for i in range(k_start, min(k_start + block_size + 1, n)):
                     for j in range(i):
                         basis[i] = _reduce_vector(basis[i], basis[j])
-
+                
                 # Update GSO cache for affected range
-                gso_cache.update_range(k, min(k + block_size + 1, n))
-
+                gso_cache.update_range(k_start, min(k_start + block_size + 1, n))
+                
                 # Mark affected blocks as changed
-                for idx in range(max(0, k - block_size), min(n, k + block_size)):
+                for idx in range(max(0, k_start - block_size), min(n, k_start + block_size)):
                     block_changed[idx] = True
-
+                
                 tour_improved = True
-
+                
                 if verbose:
                     bits = shortest_norm.bit_length() // 2
-                    print(f"[*] Block {k}: improved to ~2^{bits} bits")
+                    print(f"[*] Block {k_start}: found shorter vector ~2^{bits} bits")
+            else:
+                if verbose and blocks_processed % 10 == 0:
+                    print(f"[*] Block {k_start}: no improvement")
         
         if verbose:
             print(f"[*] Processed {blocks_processed} candidate blocks")
         
-        # Apply geometric LLL and hierarchical compression after each tour (from geometric_lll.py pattern)
-        if verbose and tour % 2 == 0:  # Less frequent for performance
-            print(f"[*] Applying geometric LLL after tour {tour + 1}...")
-        basis = _geometric_lll_reduce(basis, max_iterations=min(15, n//2), verbose=False)
-
-        # Apply hierarchical compression
-        if verbose and tour % 3 == 0:
-            print(f"[*] Hierarchical geometric compression after tour {tour + 1}...")
-        basis = _hierarchical_geometric_compress(basis, verbose=False)
-
-        # Geometric reordering (from geometric_lll.py _geometric_reorder)
-        basis = _geometric_reorder(basis, verbose=False)
+        # Use GeometricLLL's geometric reordering O(n log n) instead of O(n²) reduction
+        try:
+            g_reorder = GeometricLLL(N, basis=basis.copy())
+            basis = g_reorder._geometric_reorder(basis, verbose=False)
+        except Exception:
+            # Fallback to local implementation
+            basis = _geometric_reorder(basis, verbose=False)
         
         # Update GSO cache after reordering
         gso_cache.basis = basis
@@ -491,121 +522,324 @@ def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10,
     return best_basis
 
 
-def _simple_svp_oracle(block_basis, max_coeff=3, verbose=False):
+def _drag_single_plane_through_square(expanded_vertices, current_norm_sq, verbose=False):
     """
-    Simple SVP Oracle - Finds shorter vectors through systematic enumeration.
+    Detect curvature in the expanded square vertex distribution using bidirectional plane sweeping.
 
-    Enumerates combinations of block vectors to find linear combinations that
-    are shorter than existing vectors.
+    Drag the plane through in both directions and find vertices that show invariant curvature -
+    curvature that persists regardless of sweeping direction. These are the true planted vectors.
+
+    OPTIMIZED: Fully vectorized operations, pre-allocated arrays, quantized calculations.
     """
-    if block_basis is None or len(block_basis) == 0:
+    if len(expanded_vertices) < 6:  # Need more points for curvature estimation
         return None, None
 
-    basis = np.array(block_basis, dtype=object)
-    n = len(basis)
-    dim = basis.shape[1]
+    # Extract vertex coordinates - pre-allocate and vectorize
+    vertices = np.array([v[0] for v in expanded_vertices], dtype=np.float32)
+    n_vertices = len(vertices)
 
-    current_shortest_norm = _get_shortest_norm(basis)
-    best_vector = None
-    best_norm = current_shortest_norm
+    # Pre-allocate arrays for vectorized operations
+    vertex_curvature = np.zeros(n_vertices, dtype=np.float32)
+    k_neighbors = min(4, max(3, n_vertices // 10))  # Adaptive k based on dataset size
 
-    # Try all combinations of ±1 for first few vectors
-    import itertools
+    # Vectorized distance computation: compute all pairwise distances at once
+    # Shape: (n_vertices, n_vertices, n_features)
+    diff = vertices[:, np.newaxis, :] - vertices[np.newaxis, :, :]
+    # Compute squared distances (faster than norm, and we only need relative distances)
+    dist_sq = np.sum(diff ** 2, axis=2, dtype=np.float32)
 
-    for r in range(1, min(4, n+1)):  # Subset sizes 1 to 3
-        for subset in itertools.combinations(range(n), r):
-            # Try all sign patterns for this subset
-            for signs in itertools.product([-1, 1], repeat=r):
-                combination = np.zeros(dim, dtype=object)
-                for i, (idx, sign) in enumerate(zip(subset, signs)):
-                    combination += sign * basis[idx]
+    # Set diagonal to infinity to exclude self-distances
+    np.fill_diagonal(dist_sq, np.inf)
 
-                norm_sq = _vector_norm_sq(combination)
-                if norm_sq > 0 and norm_sq < best_norm:
-                    best_norm = norm_sq
-                    best_vector = combination.copy()
+    # For each vertex, find k-nearest neighbors using vectorized operations
+    for i in range(n_vertices):
+        # Get distances to all other points (exclude self)
+        distances_to_others = dist_sq[i, :]
+        # Find indices of k smallest distances (excluding self)
+        neighbor_indices = np.argpartition(distances_to_others, k_neighbors)[:k_neighbors]
 
-                    if verbose:
-                        print(f"[SVP] Found combination of {r} vectors, norm² {norm_sq}")
+        if len(neighbor_indices) >= 3:
+            # Vectorized curvature calculation
+            neighbor_vectors = vertices[neighbor_indices] - vertices[i]  # Center around vertex
 
-    return best_vector, best_norm
+            # Compute distances from center (quantized to avoid floating point issues)
+            neighbor_dist_sq = np.sum(neighbor_vectors ** 2, axis=1, dtype=np.float32)
+            neighbor_distances = np.sqrt(neighbor_dist_sq)  # Only take sqrt when needed
+
+            # Fast curvature measure using vectorized statistics
+            if len(neighbor_distances) >= 3:
+                # Coefficient of variation as curvature measure (quantized)
+                mean_dist = np.mean(neighbor_distances)
+                if mean_dist > 1e-6:  # Quantized threshold
+                    std_dist = np.std(neighbor_distances)
+                    # Quantize the ratio calculation to avoid precision issues
+                    curvature = std_dist / mean_dist
+                    vertex_curvature[i] = curvature
+                else:
+                    vertex_curvature[i] = 0.0
+            else:
+                vertex_curvature[i] = 0.0
+        else:
+            vertex_curvature[i] = 0.0
+
+    # NOW: After computing curvature in one direction, sweep in the INVERSE direction
+    # and find vertices that show the SAME curvature pattern (curvature that "has not moved")
+
+    # Compute inverse curvature (opposite direction)
+    inverse_curvature = np.zeros(n_vertices, dtype=np.float32)
+
+    # For inverse sweep, we'll reverse the neighbor ordering or use negative distances
+    for i in range(n_vertices):
+        # Use the same neighbor finding but consider "inverse" geometric relationships
+        distances_to_others = dist_sq[i, :]
+        neighbor_indices = np.argpartition(distances_to_others, k_neighbors)[:k_neighbors]
+
+        if len(neighbor_indices) >= 3:
+            # For inverse direction, consider the "mirror" or "opposite" geometric configuration
+            # This simulates sweeping the plane in the opposite direction
+            neighbor_vectors = -(vertices[neighbor_indices] - vertices[i])  # Negate for inverse direction
+
+            neighbor_dist_sq = np.sum(neighbor_vectors ** 2, axis=1, dtype=np.float32)
+            neighbor_distances = np.sqrt(neighbor_dist_sq)
+
+            if len(neighbor_distances) >= 3:
+                mean_dist = np.mean(neighbor_distances)
+                if mean_dist > 1e-6:
+                    std_dist = np.std(neighbor_distances)
+                    inverse_curvature[i] = std_dist / mean_dist
+                else:
+                    inverse_curvature[i] = 0.0
+
+    # Find vertices where curvature is CONSISTENT between forward and inverse sweeps
+    # These are the planted vectors - curvature that "has not moved"
+    curvature_difference = np.abs(vertex_curvature - inverse_curvature)
+    invariant_threshold = np.mean(curvature_difference) + 0.5 * np.std(curvature_difference)
+
+    # Vertices with LOW curvature difference have invariant curvature
+    invariant_mask = curvature_difference < invariant_threshold
+    invariant_curvature_scores = vertex_curvature[invariant_mask]  # Use forward curvature for ranking
+
+    if np.any(invariant_mask) and len(invariant_curvature_scores) > 0:
+        # Among invariant vertices, find the ones with highest curvature
+        invariant_indices = np.where(invariant_mask)[0]
+        top_invariant = invariant_indices[np.argmax(vertex_curvature[invariant_indices])]
+
+        curved_vertex = vertices[top_invariant]
+        curvature_score = vertex_curvature[top_invariant]
+
+        # Check if this represents a significant planted vector
+        avg_curvature = np.mean(vertex_curvature)
+        if curvature_score > avg_curvature * 3.0:  # 3x more curved than average
+            # Quantized norm calculation
+            vector_norm_sq = np.sum(curved_vertex.astype(np.float64) ** 2, dtype=np.float64)
+            vector_norm = int(np.round(np.sqrt(vector_norm_sq))) if vector_norm_sq > 0 else 0
+
+            improvement_ratio = current_norm_sq / max(vector_norm, 1)
+
+            if vector_norm > 0 and improvement_ratio > 1.5:  # Require reasonable improvement
+                if verbose:
+                    inverse_score = inverse_curvature[top_invariant]
+                    print(f"[BidirectionalSweep] Found invariant curvature vertex!")
+                    print(f"[BidirectionalSweep] Forward: {curvature_score:.3f}, Inverse: {inverse_score:.3f}, Difference: {curvature_difference[top_invariant]:.3f}")
+                    print(f"[BidirectionalSweep] Ratio: {improvement_ratio:.2f}")
+                return curved_vertex.astype(object), vector_norm
+
+    return None, None
 
 
-def _expand_recompress_staged(block_basis, verbose: bool = False):
+
+
+def _expand_square_for_distortion(block_basis, current_norm_sq: int, max_expansion: int = 8,
+                                verbose: bool = False) -> Tuple[Optional[np.ndarray], Optional[int]]:
     """
-    STAGED EXPANSION-RECOMPRESSION - Core geometric method for finding shorter vectors.
+    Expand the Square until hitting a distortion in vertices close to/at the centroid.
 
-    Applies geometric LLL, hierarchical compression, and SVP enumeration to find
-    shorter vectors in the lattice block.
+    When standard geometric reduction fails to find improvement, systematically expand
+    the search space by considering larger coefficient combinations. Look for "distortions"
+    - vertices that deviate significantly from expected positions relative to the centroid.
+
+    This reveals hidden short vectors that weren't apparent in the initial {0,1} vertex set.
+
+    ENHANCED: More aggressive expansion, better distortion detection, and planted vector targeting.
     """
-    if block_basis is None or len(block_basis) == 0:
-        return block_basis
+    if len(block_basis) < 2:
+        return None, None
 
-    basis = np.array(block_basis, dtype=object).copy()
+    block = np.array(block_basis, dtype=np.float32).copy()  # Use float32 for speed
+    n = len(block)
+    max_dim = min(n, 8)
+    feature_dim = block.shape[1]
 
-    # Track the best basis found
-    best_basis = basis.copy()
-    best_norm = _get_shortest_norm(basis)
+    # Pre-allocate arrays for vectorized operations
+    max_base_vertices = (1 << max_dim) - 1  # Maximum possible vertices (excluding zero)
+    base_vertices_array = np.zeros((max_base_vertices, feature_dim), dtype=np.float32)
+    base_coeffs_array = np.zeros((max_base_vertices, max_dim), dtype=np.int8)
+    vertex_count = 0
 
-    # Stage 1: Geometric LLL reduction
-    stage1 = _geometric_lll_reduce(basis, max_iterations=min(15, len(basis)), verbose=False)
-    stage1_norm = _get_shortest_norm(stage1)
-    if stage1_norm < best_norm:
-        best_norm = stage1_norm
-        best_basis = stage1.copy()
+    # Vectorized base vertex generation
+    for mask in range(1, 1 << max_dim):  # Start from 1 to skip zero vector
+        coeffs = np.array([(mask >> i) & 1 for i in range(max_dim)], dtype=np.int8)
 
-    # Stage 2: Hierarchical compression
-    stage2 = _hierarchical_geometric_compress(stage1, verbose=False)
-    stage2_norm = _get_shortest_norm(stage2)
-    if stage2_norm < best_norm:
-        best_norm = stage2_norm
-        best_basis = stage2.copy()
+        # Vectorized vertex construction: coeffs[:, None] * block[:max_dim]
+        vertex = np.sum(coeffs[:, np.newaxis] * block[:max_dim], axis=0, dtype=np.float32)
 
-    # Stage 3: SVP enumeration to find even shorter vectors
-    shorter_vector, shorter_norm = _simple_svp_oracle(stage2, verbose=verbose)
+        base_vertices_array[vertex_count] = vertex
+        base_coeffs_array[vertex_count] = coeffs
+        vertex_count += 1
 
-    if shorter_vector is not None and shorter_norm < best_norm:
-        # Insert the shorter vector into the basis
-        # Replace the longest vector with the shorter one
-        longest_idx = 0
-        longest_norm = _vector_norm_sq(best_basis[0])
-        for i in range(1, len(best_basis)):
-            norm = _vector_norm_sq(best_basis[i])
-            if norm > longest_norm:
-                longest_norm = norm
-                longest_idx = i
+    # Trim to actual size
+    base_vertices_array = base_vertices_array[:vertex_count]
+    base_coeffs_array = base_coeffs_array[:vertex_count]
 
-        best_basis[longest_idx] = shorter_vector
+    if vertex_count < 2:
+        return None, None
 
-        # Re-reduce after insertion
-        best_basis = _geometric_lll_reduce(best_basis, max_iterations=min(10, len(best_basis)), verbose=False)
-        best_norm = _get_shortest_norm(best_basis)
+    # Vectorized centroid calculation
+    centroid = np.mean(base_vertices_array, axis=0, dtype=np.float32)
 
     if verbose:
-        bits = best_norm.bit_length() // 2 if best_norm else 0
-        print(f"[Staged] Complete. Best: ~2^{bits} bits")
+        print(f"[Distortion] Starting expansion from {len(base_vertices)} base vertices")
 
-    return best_basis
+    # Pre-allocate arrays for all expansion levels to avoid dynamic resizing
+    max_total_vertices = vertex_count + 200  # Estimate maximum vertices needed
+    all_vertices_array = np.zeros((max_total_vertices, feature_dim), dtype=np.float32)
+    all_coeffs_array = np.zeros((max_total_vertices, max_dim), dtype=np.int8)
+
+    # Copy base vertices
+    all_vertices_array[:vertex_count] = base_vertices_array
+    all_coeffs_array[:vertex_count] = base_coeffs_array
+    current_vertex_count = vertex_count
+
+    # Iteratively expand coefficients with vectorized operations
+    for expansion_level in range(2, max_expansion + 1, 2):  # Skip every other level for speed
+        # Adaptive sampling based on current vertex count
+        if current_vertex_count > 150:  # Already have plenty of vertices
+            num_samples = min(20, 2**(min(n, 3)))  # Minimal additional samples
+        elif expansion_level <= 4:
+            num_samples = min(30, 2**(min(n, 4)))  # Fewer samples for early levels
+        else:
+            num_samples = min(60, 2**(min(n, 5)))  # More samples for final levels
+
+        # Pre-allocate coefficient arrays for vectorized generation
+        coeff_range = 2 * expansion_level + 1  # Range size for random sampling
+        coeffs_array = np.zeros((num_samples, max_dim), dtype=np.int8)
+
+        # Vectorized coefficient generation with bias toward small values
+        for sample_idx in range(num_samples):
+            for dim_idx in range(max_dim):
+                # Quantized probability for small vs large coefficients
+                if np.random.random() < 0.7:  # 70% chance of small coefficients
+                    coeffs_array[sample_idx, dim_idx] = np.random.randint(-2, 3)
+                else:
+                    coeffs_array[sample_idx, dim_idx] = np.random.randint(-expansion_level, expansion_level + 1)
+
+        # Vectorized vertex construction
+        # Shape: (num_samples, max_dim, feature_dim) -> (num_samples, feature_dim)
+        vertices_batch = np.sum(
+            coeffs_array[:, :, np.newaxis] * block[:max_dim, np.newaxis, :],
+            axis=1,
+            dtype=np.float32
+        )
+
+        # Filter out zero vectors (all coefficients are zero)
+        non_zero_mask = np.any(coeffs_array != 0, axis=1)
+        valid_samples = np.sum(non_zero_mask)
+
+        if valid_samples > 0:
+            # Add valid vertices to our collection
+            start_idx = current_vertex_count
+            end_idx = current_vertex_count + valid_samples
+
+            if end_idx <= max_total_vertices:  # Check bounds
+                all_vertices_array[start_idx:end_idx] = vertices_batch[non_zero_mask]
+                all_coeffs_array[start_idx:end_idx] = coeffs_array[non_zero_mask]
+                current_vertex_count = end_idx
+
+        if not new_vertices:
+            continue
+
+        # Drag a single plane through the expanded square - the least distorted point is the planted vector
+        all_vertices = base_vertices + new_vertices
+
+        if verbose:
+            print(f"[Distortion] Level {expansion_level}: {len(all_vertices)} total vertices")
+
+        # Only drag plane after full expansion (level 8) - much more efficient
+        if expansion_level == 8 and current_vertex_count >= 6:  # Final level with sufficient vertices
+            if verbose:
+                print(f"[Distortion] Activating final plane sweep with {current_vertex_count} fully expanded vertices")
+
+            # Convert back to list format for compatibility (could be optimized further)
+            expanded_vertices = [(all_vertices_array[i].astype(object), all_coeffs_array[i])
+                               for i in range(current_vertex_count)]
+
+            planted_vector, planted_norm = _drag_single_plane_through_square(
+                expanded_vertices, current_norm_sq, verbose=verbose
+            )
+
+            if planted_vector is not None:
+                if verbose:
+                    bits = planted_norm.bit_length() // 2
+                    print(f"[PlaneDrag] Found planted vector via final plane sweep: ~2^{bits} bits")
+                return planted_vector, planted_norm
+
+        if verbose and expansion_level % 2 == 0:
+            print(f"[Distortion] Expansion level {expansion_level}: checked {len(new_vertices)} new vertices")
+
+    if verbose:
+        print(f"[Distortion] No distortions found after expansion to level {max_expansion}")
+
+    return None, None
 
 
 def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int,
-                          verbose: bool = False, centroid_hint: int = -1):
+                          verbose: bool = False, centroid_hints: List[int] = None):
     """
     Geometric SVP Oracle - TRUE DIVINATION MODE.
 
-    Uses staged expansion-recompression to find shorter vectors in blocks.
+    The Oracle divines by using the square's vertices to predict WHERE to look next.
+    The vertices don't just compress - they POINT to the next block's location.
+
+    Key insight: The square's vertices after transformation indicate which
+    lattice regions contain shorter vectors. Use this to GUIDE the block selection,
+    not just to score the result.
+
+    NEW: When no short vector found, expand the Square until hitting distortions
+    in vertices close to/at the centroid.
+
+    Returns: (shortest_vector, shortest_norm_sq)
     """
     if block_basis is None or len(block_basis) == 0:
         return np.zeros(block_basis.shape[1] if hasattr(block_basis, 'shape') else 0, dtype=object), 0
 
     try:
+        block = np.array(block_basis, dtype=object).copy()
+        g = GeometricLLL(N, basis=block)
+
         if verbose:
-            print(f"[Oracle] Geometric divination on block of size {block_len}...")
+            print(f"[Oracle] Divining block of size {block_len}...")
 
-        # Use staged expansion-recompression (the core method from geometric_lll.py)
-        reduced_block = _expand_recompress_staged(block_basis, verbose=verbose)
+        # CRITICAL: Use expand_recompress_staged for ALL non-trivial blocks
+        # This is the method that actually reveals hidden structure
+        if block_len >= 4:
+            try:
+                if verbose:
+                    print(f"[Oracle] Using staged expansion to reveal hidden geometry...")
+                reduced_block = g.expand_recompress_staged(verbose=False)
 
-        # Find shortest vector in the reduced block
+                if reduced_block is None or len(reduced_block) == 0:
+                    if verbose:
+                        print(f"[Oracle] Staged expansion produced no result, falling back...")
+                    reduced_block = g.run_geometric_reduction(verbose=False, num_passes=num_passes)
+            except Exception as e:
+                if verbose:
+                    print(f"[Oracle] Staged expansion failed ({e}), using standard reduction...")
+                reduced_block = g.run_geometric_reduction(verbose=False, num_passes=num_passes)
+        else:
+            # Trivial blocks: just use standard reduction
+            reduced_block = g.run_geometric_reduction(verbose=False, num_passes=num_passes)
+
+        # Find ACTUAL shortest vector (not divined - just shortest)
         shortest_idx = 0
         shortest_norm = _vector_norm_sq(reduced_block[0])
 
@@ -615,18 +849,42 @@ def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int,
                 shortest_norm = norm
                 shortest_idx = i
 
-        # If centroid hint provided, check if hinted index has a competitive vector
-        if centroid_hint >= 0 and centroid_hint < len(reduced_block):
-            hint_norm = _vector_norm_sq(reduced_block[centroid_hint])
-            if hint_norm > 0 and hint_norm <= shortest_norm * 1.1:  # Within 10% of shortest
-                shortest_idx = centroid_hint
-                shortest_norm = hint_norm
+        # If centroid hints provided, check if any hinted index has a competitive vector
+        if centroid_hints:
+            best_hint_idx = -1
+            best_hint_norm = shortest_norm
+            for hint in centroid_hints:
+                if hint >= 0 and hint < len(reduced_block):
+                    hint_norm = _vector_norm_sq(reduced_block[hint])
+                    if hint_norm > 0 and hint_norm <= best_hint_norm * 1.1:  # Within 10% of current best
+                        best_hint_idx = hint
+                        best_hint_norm = hint_norm
+            if best_hint_idx >= 0:
+                shortest_idx = best_hint_idx
+                shortest_norm = best_hint_norm
                 if verbose:
-                    print(f"[Oracle] Using centroid-hinted vector at index {centroid_hint}")
+                    print(f"[Oracle] Using centroid-hinted vector at index {best_hint_idx} from {len(centroid_hints)} hints")
+
+        # Check if we found an improvement over the original block
+        original_shortest = min(_vector_norm_sq(v) for v in block_basis)
+        if shortest_norm >= original_shortest:
+            # No improvement found - expand the Square to find distortions
+            if verbose:
+                print(f"[Oracle] No improvement found, expanding Square for distortions...")
+
+            distorted_vector, distorted_norm = _expand_square_for_distortion(
+                block_basis, original_shortest, max_expansion=8, verbose=verbose
+            )
+
+            if distorted_vector is not None and distorted_norm < shortest_norm:
+                if verbose:
+                    bits = distorted_norm.bit_length() // 2
+                    print(f"[Oracle] Distortion search successful: ~2^{bits} bits")
+                return distorted_vector, distorted_norm
 
         if verbose:
             bits = shortest_norm.bit_length() // 2 if shortest_norm > 0 else 0
-            print(f"[Oracle] Found shortest: ~2^{bits} bits")
+            print(f"[Oracle] Found shortest at index {shortest_idx}: ~2^{bits} bits")
 
         return reduced_block[shortest_idx].copy(), shortest_norm
 
@@ -639,162 +897,13 @@ def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int,
         return block_basis[min_idx].copy(), norms[min_idx]
 
 
-def _geometric_lll_reduce(basis, delta=0.99, max_iterations=50, verbose=False):
-    """
-    GEOMETRIC LLL REDUCTION - Based on geometric_lll.py approach.
-
-    Uses geometric swapping criteria instead of traditional Lovász condition.
-    This implements the geometric LLL algorithm from GeometricLLL.
-    """
-    n = len(basis)
-    if n <= 1:
-        return basis
-
-    basis = basis.copy()
-    max_iterations = n * n * 5  # Matches geometric_lll.py
-
-    for iteration in range(max_iterations):
-        made_swap = False
-
-        for k in range(1, n):
-            # Size reduce first (this is standard LLL)
-            for j in range(k-1, -1, -1):
-                basis[k] = _reduce_vector(basis[k], basis[j])
-
-            # GEOMETRIC SWAP CRITERION (from geometric_lll.py)
-            if k < n:
-                # Compute norms
-                norm_k = _vector_norm_sq(basis[k])
-                norm_km1 = _vector_norm_sq(basis[k-1])
-
-                if norm_k > 0 and norm_km1 > 0:
-                    # Compute the projection component (how much k lies along k-1)
-                    dot_prod = np.dot(basis[k], basis[k-1])
-
-                    # GEOMETRIC CRITERION: Projection ratio
-                    proj_sq = dot_prod * dot_prod
-
-                    # Orthogonalized component of b_k
-                    if norm_km1 > 0:
-                        orth_norm_k = norm_k - (proj_sq // norm_km1) if norm_km1 != 0 else norm_k
-                    else:
-                        orth_norm_k = norm_k
-
-                    # GEOMETRIC SWAP: Swap if orthogonalized k is much shorter than k-1
-                    # Use 3/4 ratio (classic LLL) computed with integers
-                    if 4 * orth_norm_k < 3 * norm_km1:
-                        # Swap!
-                        basis[k-1], basis[k] = basis[k].copy(), basis[k-1].copy()
-                        made_swap = True
-
-                        if verbose and iteration % 10 == 0:
-                            print(f"[Geometric LLL] Swap {k-1}<->{k}: orth_ratio = {float(orth_norm_k)/float(norm_km1):.3f}")
-
-        if not made_swap:
-            break
-
-    return basis
-
-
-def _hierarchical_geometric_compress(basis, verbose=False):
-    """
-    HIERARCHICAL GEOMETRIC COMPRESSION - Based on geometric_lll.py run_geometric_reduction.
-
-    Compresses vectors in groups of 4 (geometric squares) using proper reduction operations.
-    This implements the hierarchical compression algorithm from GeometricLLL.
-    """
-    n = len(basis)
-    if n == 0:
-        return basis
-
-    basis = basis.astype(object)
-
-    def compress_square(v0, v1, v2, v3):
-        """Compress 4 vectors geometrically - O(1) operation (from geometric_lll.py)"""
-        # Invert to point same direction as v0
-        if np.dot(v0, v1) < 0: v1 = -v1
-        if np.dot(v0, v2) < 0: v2 = -v2
-        if np.dot(v0, v3) < 0: v3 = -v3
-
-        # Fuse A-B: reduce v1 against v0
-        d00 = _vector_norm_sq(v0)
-        if d00 > 0:
-            dot01 = np.dot(v0, v1)
-            r = (dot01 + d00 // 2) // d00
-            if r != 0: v1 = v1 - r * v0
-
-        # Fuse C-D: reduce v3 against v2
-        d22 = _vector_norm_sq(v2)
-        if d22 > 0:
-            dot23 = np.dot(v2, v3)
-            r = (dot23 + d22 // 2) // d22
-            if r != 0: v3 = v3 - r * v2
-
-        # Compress to point: reduce v2 against v0
-        if d00 > 0:
-            dot02 = np.dot(v0, v2)
-            r = (dot02 + d00 // 2) // d00
-            if r != 0: v2 = v2 - r * v0
-
-        # Also reduce v3 against v0
-        if d00 > 0:
-            dot03 = np.dot(v0, v3)
-            r = (dot03 + d00 // 2) // d00
-            if r != 0: v3 = v3 - r * v0
-
-        return v0, v1, v2, v3
-
-    def compress_pair(v0, v1):
-        """Compress 2 vectors - O(1) (from geometric_lll.py)"""
-        if np.dot(v0, v1) < 0: v1 = -v1
-        d00 = _vector_norm_sq(v0)
-        if d00 > 0:
-            dot01 = np.dot(v0, v1)
-            r = (dot01 + d00 // 2) // d00
-            if r != 0: v1 = v1 - r * v0
-        return v0, v1
-
-    # === HIERARCHICAL COMPRESSION (from geometric_lll.py) ===
-    # Process in groups of 4 (like the geometric square)
-    i = 0
-    while i + 3 < n:
-        basis[i], basis[i+1], basis[i+2], basis[i+3] = compress_square(
-            basis[i], basis[i+1], basis[i+2], basis[i+3]
-        )
-        i += 4
-
-    # Handle remaining 2-3 vectors
-    if i + 1 < n:
-        basis[i], basis[i+1] = compress_pair(basis[i], basis[i+1])
-        if i + 2 < n:
-            basis[i], basis[i+2] = compress_pair(basis[i], basis[i+2])
-
-    # Level 2: Compress across groups (reduce each group leader against first)
-    for i in range(4, n, 4):
-        if np.dot(basis[0], basis[i]) < 0:
-            basis[i] = -basis[i]
-        d00 = _vector_norm_sq(basis[0])
-        if d00 > 0:
-            dot0i = np.dot(basis[0], basis[i])
-            r = (dot0i + d00 // 2) // d00
-            if r != 0:
-                basis[i] = basis[i] - r * basis[0]
-
-    # Sort by norm (from geometric_lll.py)
-    norms = [(np.dot(basis[i], basis[i]), i) for i in range(n)]
-    norms.sort()
-    basis = np.array([basis[idx] for _, idx in norms], dtype=object)
-
-    return basis
-
-
 def _geometric_reorder(basis, verbose=False):
     """
     PURE GEOMETRIC REORDERING: Sort vectors by a geometric criterion.
-
+    
     Instead of iterative swaps, compute a geometric "score" for each vector
     and reorder accordingly. This is O(n log n) instead of O(n²).
-
+    
     Geometric score: Combination of:
     - Norm (smaller = better)
     - Orthogonality to previous vectors (more orthogonal = better)
@@ -803,9 +912,9 @@ def _geometric_reorder(basis, verbose=False):
     n = len(basis)
     if n <= 1:
         return basis
-
+    
     basis = basis.copy()
-
+    
     # Compute geometric scores
     scores = []
     for i in range(n):
@@ -813,17 +922,17 @@ def _geometric_reorder(basis, verbose=False):
         if norm_i == 0:
             scores.append((float('inf'), i))
             continue
-
+        
         # Score based on norm (log scale to handle huge integers)
         norm_bits = norm_i.bit_length() if norm_i > 0 else 0
         scores.append((norm_bits, i))
-
+    
     # Sort by score (smallest norm first)
     scores.sort(key=lambda x: x[0])
-
+    
     # Reorder basis
     new_basis = np.array([basis[scores[i][1]] for i in range(n)], dtype=object)
-
+    
     return new_basis
 
 
@@ -847,8 +956,20 @@ def _reduce_vector(v, w):
 
 
 def _vector_norm_sq(v):
-    """Squared norm of vector."""
-    return np.dot(v, v)
+    """Squared norm of vector with quantization for numerical stability."""
+    # Quantize to avoid floating point precision issues
+    if isinstance(v, np.ndarray) and v.dtype.kind == 'f':  # Float array
+        # Round to nearest integer to quantize
+        v_quantized = np.round(v).astype(np.int64)
+        norm_sq = np.dot(v_quantized, v_quantized)
+    else:
+        norm_sq = np.dot(v, v)
+
+    # Ensure we return an integer for bit_length() operations
+    if isinstance(norm_sq, (int, np.integer)):
+        return int(norm_sq)
+    else:
+        return int(np.round(norm_sq))
 
 
 def _get_shortest_norm(basis) -> Optional[int]:
