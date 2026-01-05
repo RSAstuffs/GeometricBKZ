@@ -1,4 +1,4 @@
-# GeometricLLL: Advanced Lattice Reduction with Geometric Analysis
+# GeometricBKZ: Advanced Lattice Reduction with Geometric Analysis
 
 [![Geometric BKZ Performance](https://img.shields.io/badge/Geometric_BKZ-50.0%25_Planted_Detection_0.650s-brightgreen)](https://github.com/yourusername/GeometricLLL)
 [![Standard BKZ Performance](https://img.shields.io/badge/Standard_BKZ-0%25_Planted_Detection_0.068s-red)](https://github.com/yourusername/GeometricLLL)
