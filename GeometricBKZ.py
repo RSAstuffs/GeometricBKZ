@@ -133,7 +133,7 @@ class GSOCache:
         return shortest_idx, shortest_norm
 
 
-def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_candidates: int = 10) -> List[Tuple[int, int]]:
+def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_candidates: int = 10) -> Tuple[List[Tuple[int, int]], List[int]]:
     """
     Select candidate blocks using geometric probes with triangulation.
     
@@ -184,7 +184,7 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
             vertex_indices.append(contrib)
     
     if len(vertices) < 4:
-        return [(0, min(block_size, n))]
+        return [(0, min(block_size, n))], []
     
     vertices = np.array(vertices)
     
@@ -202,7 +202,7 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
     candidate_ranges = []
     
     if triangles is not None:
-        # 3. Score triangles
+        # 3. Score triangles and compute centroids for next point placement
         triangle_scores = []
         for simplex in triangles:
             # Triangle vertices
@@ -212,6 +212,19 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
             area = abs((v2[0] - v1[0])*(v3[1] - v1[1]) - (v3[0] - v1[0])*(v2[1] - v1[1])) / 2
             if area == 0:
                 continue
+            
+            # Centroid (in 2D projection space)
+            centroid = np.mean(tri_verts[:, :2], axis=0)
+            
+            # Find closest basis vector to centroid (by Euclidean distance in projection space)
+            min_dist = float('inf')
+            closest_idx = -1
+            for i in range(n):
+                basis_proj = np.array([basis[i][0], basis[i][1]], dtype=float)  # First 2 coords
+                dist = np.linalg.norm(basis_proj - centroid)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = i
             
             # Collect contributing indices from vertices
             indices = set()
@@ -224,13 +237,14 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
             
             # Score: prefer larger areas and more spread indices
             score = area * len(indices)
-            triangle_scores.append((score, indices))
+            triangle_scores.append((score, indices, closest_idx))
         
         # Sort by score descending
         triangle_scores.sort(reverse=True)
         
-        # 4. Map to contiguous ranges
-        for score, indices in triangle_scores[:max_candidates]:
+        # 4. Map to contiguous ranges, prioritizing those containing centroid indices
+        prioritized_ranges = []
+        for score, indices, centroid_idx in triangle_scores[:max_candidates]:
             # Find contiguous segments
             indices.sort()
             start = indices[0]
@@ -238,11 +252,15 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
                 if indices[i] > indices[i-1] + 1:
                     end = indices[i-1] + 1
                     if end - start >= 2:
-                        candidate_ranges.append((start, min(end, n)))
+                        prioritized_ranges.append((start, min(end, n), centroid_idx))
                     start = indices[i]
             end = indices[-1] + 1
             if end - start >= 2:
-                candidate_ranges.append((start, min(end, n)))
+                prioritized_ranges.append((start, min(end, n), centroid_idx))
+        
+        # Sort by whether range contains centroid
+        prioritized_ranges.sort(key=lambda x: x[2] in range(x[0], x[1]), reverse=True)
+        candidate_ranges = [(s, e) for s, e, c in prioritized_ranges]
     else:
         # Fallback: use PCA as before
         # Compute covariance
@@ -274,8 +292,11 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
     
     # Select top candidates
     selected = candidate_ranges[:max_candidates]
+    centroid_hints = []
+    if triangles is not None and prioritized_ranges:
+        centroid_hints = [prioritized_ranges[i][2] for i in range(min(len(prioritized_ranges), max_candidates))]
     
-    return selected if selected else [(0, min(block_size, n))]
+    return selected if selected else [(0, min(block_size, n))], centroid_hints
 
 
 def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10, 
@@ -344,7 +365,7 @@ def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10,
         blocks_skipped = 0
         
         # Geometric block selection: use parallelepiped vertices to select candidates
-        candidate_blocks = _select_candidate_blocks_geometric(basis, block_size, max_candidates=10)
+        candidate_blocks, centroid_hints = _select_candidate_blocks_geometric(basis, block_size, max_candidates=10)
         
         for k_start, k_end in candidate_blocks:
             block_len = k_end - k_start
@@ -435,7 +456,7 @@ def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10,
 
 
 def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int, 
-                          verbose: bool = False):
+                          verbose: bool = False, centroid_hint: int = -1):
     """
     Geometric SVP Oracle - TRUE DIVINATION MODE.
     
@@ -487,6 +508,15 @@ def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int,
             if norm > 0 and (shortest_norm == 0 or norm < shortest_norm):
                 shortest_norm = norm
                 shortest_idx = i
+        
+        # If centroid hint provided, check if hinted index has a competitive vector
+        if centroid_hint >= 0 and centroid_hint < len(reduced_block):
+            hint_norm = _vector_norm_sq(reduced_block[centroid_hint])
+            if hint_norm > 0 and hint_norm <= shortest_norm * 1.1:  # Within 10% of shortest
+                shortest_idx = centroid_hint
+                shortest_norm = hint_norm
+                if verbose:
+                    print(f"[Oracle] Using centroid-hinted vector at index {centroid_hint}")
         
         if verbose:
             bits = shortest_norm.bit_length() // 2 if shortest_norm > 0 else 0
