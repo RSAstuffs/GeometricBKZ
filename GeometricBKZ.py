@@ -522,18 +522,151 @@ def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10,
     return best_basis
 
 
-def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int, 
+def _expand_square_for_distortion(block_basis, current_norm_sq: int, max_expansion: int = 8,
+                                verbose: bool = False) -> Tuple[Optional[np.ndarray], Optional[int]]:
+    """
+    Expand the Square until hitting a distortion in vertices close to/at the centroid.
+
+    When standard geometric reduction fails to find improvement, systematically expand
+    the search space by considering larger coefficient combinations. Look for "distortions"
+    - vertices that deviate significantly from expected positions relative to the centroid.
+
+    This reveals hidden short vectors that weren't apparent in the initial {0,1} vertex set.
+
+    ENHANCED: More aggressive expansion, better distortion detection, and planted vector targeting.
+    """
+    if len(block_basis) < 2:
+        return None, None
+
+    block = np.array(block_basis, dtype=object).copy()
+    n = len(block)
+
+    # Start with base vertices (coefficient magnitude 1) - use full block size
+    base_vertices = []
+    for mask in range(1 << min(n, 8)):  # More combinations for better coverage
+        coeffs = [(mask >> i) & 1 for i in range(min(n, 8))]
+        if not any(coeffs):  # Skip zero vector
+            continue
+        vertex = np.zeros(block.shape[1], dtype=object)
+        for i, coeff in enumerate(coeffs):
+            vertex += coeff * block[i]
+        base_vertices.append((vertex, coeffs))
+
+    if len(base_vertices) < 2:
+        return None, None
+
+    # Compute initial centroid
+    vertices_array = np.array([v[0] for v in base_vertices])
+    centroid = np.mean(vertices_array, axis=0)
+
+    if verbose:
+        print(f"[Distortion] Starting expansion from {len(base_vertices)} base vertices")
+
+    # Iteratively expand coefficients with more aggressive search
+    for expansion_level in range(2, max_expansion + 1):
+        new_vertices = []
+
+        # Generate MORE vertices with coefficients in [-expansion_level, expansion_level]
+        num_samples = min(200, 3**(min(n, 5)))  # Much more samples for thorough search
+
+        for _ in range(num_samples):
+            coeffs = []
+            for i in range(min(n, 8)):  # Use more dimensions
+                # Bias towards smaller coefficients but allow larger ones
+                # More likely to hit small coefficients that might reveal planted vectors
+                if np.random.random() < 0.7:  # 70% chance of small coefficients
+                    coeff = np.random.randint(-2, 3)
+                else:
+                    coeff = np.random.randint(-expansion_level, expansion_level + 1)
+                coeffs.append(coeff)
+
+            if not any(coeffs):  # Skip zero vector
+                continue
+
+            vertex = np.zeros(block.shape[1], dtype=object)
+            for i, coeff in enumerate(coeffs):
+                vertex += coeff * block[i]
+
+            new_vertices.append((vertex, coeffs))
+
+        if not new_vertices:
+            continue
+
+        # Analyze distortions with multiple criteria
+        all_vertices = base_vertices + new_vertices
+
+        # Compute distances from centroid using multiple projections
+        distances = []
+        for vertex, coeffs in all_vertices:
+            # Use multiple projections for better distortion detection
+            dist_sum = 0
+            for dim_start in range(0, min(6, block.shape[1]), 2):
+                dim_end = min(dim_start + 3, block.shape[1])
+                vertex_proj = np.array(vertex[dim_start:dim_end], dtype=float)
+                centroid_proj = np.array(centroid[dim_start:dim_end], dtype=float)
+                dist_sum += np.linalg.norm(vertex_proj - centroid_proj)
+
+            avg_dist = dist_sum / max(1, min(6, block.shape[1]) // 2)
+            distances.append((avg_dist, vertex, coeffs))
+
+        distances.sort(key=lambda x: x[0])  # Sort by distance from centroid
+
+        # More aggressive distortion detection
+        if len(distances) >= 5:
+            # Use multiple thresholds for finding distortions
+            percentiles = [10, 25, 50]  # 10th, 25th, 50th percentiles
+            percentile_values = np.percentile([d[0] for d in distances], percentiles)
+
+            for threshold_mult in [0.1, 0.2, 0.3, 0.5]:  # Multiple threshold multipliers
+                for dist, vertex, coeffs in distances:
+                    # Check against multiple percentiles
+                    is_distorted = False
+                    for p_val in percentile_values:
+                        if dist < p_val * threshold_mult:
+                            is_distorted = True
+                            break
+
+                    if is_distorted:
+                        # This vertex represents a potential short vector combination
+                        candidate_vector = vertex.copy()
+
+                        # Compute its norm
+                        norm_sq = _vector_norm_sq(candidate_vector)
+
+                        # More aggressive acceptance: accept if significantly better
+                        improvement_ratio = current_norm_sq / max(norm_sq, 1)
+                        if norm_sq > 0 and (improvement_ratio > 1.1 or norm_sq < current_norm_sq * 0.8):
+                            if verbose:
+                                bits = norm_sq.bit_length() // 2
+                                print(f"[Distortion] Found distorted vertex at level {expansion_level}: ~2^{bits} bits")
+                                print(f"[Distortion] Coefficients: {coeffs[:min(8, len(coeffs))]}")
+                                print(f"[Distortion] Improvement ratio: {improvement_ratio:.2f}")
+                            return candidate_vector, norm_sq
+
+        if verbose and expansion_level % 2 == 0:
+            print(f"[Distortion] Expansion level {expansion_level}: checked {len(new_vertices)} new vertices")
+
+    if verbose:
+        print(f"[Distortion] No distortions found after expansion to level {max_expansion}")
+
+    return None, None
+
+
+def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int,
                           verbose: bool = False, centroid_hints: List[int] = None):
     """
     Geometric SVP Oracle - TRUE DIVINATION MODE.
-    
+
     The Oracle divines by using the square's vertices to predict WHERE to look next.
     The vertices don't just compress - they POINT to the next block's location.
-    
+
     Key insight: The square's vertices after transformation indicate which
     lattice regions contain shorter vectors. Use this to GUIDE the block selection,
     not just to score the result.
-    
+
+    NEW: When no short vector found, expand the Square until hitting distortions
+    in vertices close to/at the centroid.
+
     Returns: (shortest_vector, shortest_norm_sq)
     """
     if block_basis is None or len(block_basis) == 0:
@@ -542,10 +675,10 @@ def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int,
     try:
         block = np.array(block_basis, dtype=object).copy()
         g = GeometricLLL(N, basis=block)
-        
+
         if verbose:
             print(f"[Oracle] Divining block of size {block_len}...")
-        
+
         # CRITICAL: Use expand_recompress_staged for ALL non-trivial blocks
         # This is the method that actually reveals hidden structure
         if block_len >= 4:
@@ -553,7 +686,7 @@ def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int,
                 if verbose:
                     print(f"[Oracle] Using staged expansion to reveal hidden geometry...")
                 reduced_block = g.expand_recompress_staged(verbose=False)
-                
+
                 if reduced_block is None or len(reduced_block) == 0:
                     if verbose:
                         print(f"[Oracle] Staged expansion produced no result, falling back...")
@@ -569,13 +702,13 @@ def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int,
         # Find ACTUAL shortest vector (not divined - just shortest)
         shortest_idx = 0
         shortest_norm = _vector_norm_sq(reduced_block[0])
-        
+
         for i in range(1, len(reduced_block)):
             norm = _vector_norm_sq(reduced_block[i])
             if norm > 0 and (shortest_norm == 0 or norm < shortest_norm):
                 shortest_norm = norm
                 shortest_idx = i
-        
+
         # If centroid hints provided, check if any hinted index has a competitive vector
         if centroid_hints:
             best_hint_idx = -1
@@ -591,13 +724,30 @@ def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int,
                 shortest_norm = best_hint_norm
                 if verbose:
                     print(f"[Oracle] Using centroid-hinted vector at index {best_hint_idx} from {len(centroid_hints)} hints")
-        
+
+        # Check if we found an improvement over the original block
+        original_shortest = min(_vector_norm_sq(v) for v in block_basis)
+        if shortest_norm >= original_shortest:
+            # No improvement found - expand the Square to find distortions
+            if verbose:
+                print(f"[Oracle] No improvement found, expanding Square for distortions...")
+
+            distorted_vector, distorted_norm = _expand_square_for_distortion(
+                block_basis, original_shortest, max_expansion=8, verbose=verbose
+            )
+
+            if distorted_vector is not None and distorted_norm < shortest_norm:
+                if verbose:
+                    bits = distorted_norm.bit_length() // 2
+                    print(f"[Oracle] Distortion search successful: ~2^{bits} bits")
+                return distorted_vector, distorted_norm
+
         if verbose:
             bits = shortest_norm.bit_length() // 2 if shortest_norm > 0 else 0
             print(f"[Oracle] Found shortest at index {shortest_idx}: ~2^{bits} bits")
 
         return reduced_block[shortest_idx].copy(), shortest_norm
-        
+
     except Exception as e:
         if verbose:
             print(f"[!] Oracle failed: {e}, using fallback")
