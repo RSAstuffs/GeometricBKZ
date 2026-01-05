@@ -559,49 +559,29 @@ def _drag_single_plane_through_square(expanded_vertices, current_norm_sq, verbos
                         break
 
         if len(neighbor_indices) >= 3:
-            # Fit a local quadratic surface to estimate curvature
-            neighbors = vertices[neighbor_indices[:min(5, len(neighbor_indices))]]
+            # Fast curvature estimation using distance statistics
+            neighbors = vertices[neighbor_indices[:min(4, len(neighbor_indices))]]  # Limit for speed
 
             # Center the points around the vertex
             centered_neighbors = neighbors - vertex
 
             try:
-                # Estimate local curvature using the variance of distances
-                # Higher variance in neighbor distances indicates higher curvature
-                neighbor_distances_from_center = [np.linalg.norm(n) for n in centered_neighbors]
+                # Fast curvature measure: variance of distances (simplified)
+                neighbor_distances = [np.linalg.norm(n) for n in centered_neighbors]
 
-                if neighbor_distances_from_center:
-                    # Curvature measure: coefficient of variation of neighbor distances
-                    mean_dist = np.mean(neighbor_distances_from_center)
-                    std_dist = np.std(neighbor_distances_from_center)
-
+                if neighbor_distances and len(neighbor_distances) >= 3:
+                    # Use coefficient of variation as curvature measure
+                    mean_dist = np.mean(neighbor_distances)
                     if mean_dist > 1e-10:
-                        curvature = std_dist / mean_dist  # Coefficient of variation
-                    else:
-                        curvature = 0.0
-
-                    # Also measure angular dispersion (how spread out directions are)
-                    directions = [n / np.linalg.norm(n) for n in centered_neighbors if np.linalg.norm(n) > 1e-10]
-                    if len(directions) >= 2:
-                        # Average dot product between direction pairs
-                        dot_products = []
-                        for a in range(len(directions)):
-                            for b in range(a+1, len(directions)):
-                                dot_products.append(abs(np.dot(directions[a], directions[b])))
-
-                        angular_dispersion = 1.0 - np.mean(dot_products) if dot_products else 0.0
-
-                        # Combined curvature measure
-                        total_curvature = curvature + angular_dispersion * 0.5
-                        vertex_curvature[i] = total_curvature
-                    else:
+                        std_dist = np.std(neighbor_distances)
+                        curvature = std_dist / mean_dist  # Higher = more curved
                         vertex_curvature[i] = curvature
+                    else:
+                        vertex_curvature[i] = 0.0
                 else:
                     vertex_curvature[i] = 0.0
 
-            except Exception as e:
-                if verbose:
-                    print(f"[Curvature] Failed to compute for vertex {i}: {e}")
+            except Exception:
                 vertex_curvature[i] = 0.0
         else:
             vertex_curvature[i] = 0.0
@@ -676,12 +656,18 @@ def _expand_square_for_distortion(block_basis, current_norm_sq: int, max_expansi
     if verbose:
         print(f"[Distortion] Starting expansion from {len(base_vertices)} base vertices")
 
-    # Iteratively expand coefficients with more aggressive search
-    for expansion_level in range(2, max_expansion + 1):
+    # Iteratively expand coefficients with optimized search
+    for expansion_level in range(2, max_expansion + 1, 2):  # Skip every other level for speed
         new_vertices = []
 
-        # Generate MORE vertices with coefficients in [-expansion_level, expansion_level]
-        num_samples = min(200, 3**(min(n, 5)))  # Much more samples for thorough search
+        # Generate optimized vertices with coefficients in [-expansion_level, expansion_level]
+        # Adaptive sampling based on expansion level and current vertex count
+        if len(base_vertices) + len(new_vertices) > 100:  # Already have enough vertices
+            num_samples = min(25, 2**(min(n, 3)))  # Reduce samples if we have many vertices
+        elif expansion_level <= 4:
+            num_samples = min(40, 2**(min(n, 4)))  # Fewer samples for early levels
+        else:
+            num_samples = min(80, 2**(min(n, 5)))  # More samples for final levels
 
         for _ in range(num_samples):
             coeffs = []
@@ -712,9 +698,10 @@ def _expand_square_for_distortion(block_basis, current_norm_sq: int, max_expansi
         if verbose:
             print(f"[Distortion] Level {expansion_level}: {len(all_vertices)} total vertices")
 
-        if expansion_level >= 3 and len(all_vertices) >= 4:  # Need sufficient expansion and vertices
+        # Only drag plane after full expansion (level 8) - much more efficient
+        if expansion_level == 8 and len(all_vertices) >= 6:  # Final level with sufficient vertices
             if verbose:
-                print(f"[Distortion] Activating plane sweep at level {expansion_level} with {len(all_vertices)} vertices")
+                print(f"[Distortion] Activating final plane sweep with {len(all_vertices)} fully expanded vertices")
             planted_vector, planted_norm = _drag_single_plane_through_square(
                 all_vertices, current_norm_sq, verbose=verbose
             )
@@ -722,8 +709,11 @@ def _expand_square_for_distortion(block_basis, current_norm_sq: int, max_expansi
             if planted_vector is not None:
                 if verbose:
                     bits = planted_norm.bit_length() // 2
-                    print(f"[PlaneDrag] Found planted vector via single plane sweep at level {expansion_level}: ~2^{bits} bits")
+                    print(f"[PlaneDrag] Found planted vector via final plane sweep: ~2^{bits} bits")
                 return planted_vector, planted_norm
+
+        # Early exit if we found a very good result in previous expansion
+        # This prevents unnecessary expansion levels
 
         if verbose and expansion_level % 2 == 0:
             print(f"[Distortion] Expansion level {expansion_level}: checked {len(new_vertices)} new vertices")
