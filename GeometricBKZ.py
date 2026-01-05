@@ -183,6 +183,30 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
             vertices.append(v.astype(float))
             vertex_indices.append(contrib)
     
+    # Add diagonal vectors (space diagonals)
+    if d >= 2 and vertices:  # Only if we have regular vertices
+        # Main space diagonal: sum of all basis vectors in subspace
+        s = np.ones(n, dtype=object)
+        contrib = list(range(d))
+        v = np.zeros(basis.shape[1], dtype=object)
+        for j in range(d):
+            v += s[j] * basis[j]
+        vertices.append(v.astype(float))
+        vertex_indices.append(contrib)
+        
+        # Face diagonals for higher dimensions
+        if d >= 3:
+            # For 3D+: face diagonals (sum of all but one basis vector)
+            for i in range(d):
+                s = np.ones(n, dtype=object)
+                s[i] = 0  # exclude one dimension
+                contrib = [j for j in range(d) if j != i]
+                v = np.zeros(basis.shape[1], dtype=object)
+                for j in range(d):
+                    v += s[j] * basis[j]
+                vertices.append(v.astype(float))
+                vertex_indices.append(contrib)
+    
     if len(vertices) < 4:
         return [(0, min(block_size, n))], []
     
@@ -317,11 +341,25 @@ def _select_candidate_blocks_geometric(basis: np.ndarray, block_size: int, max_c
     candidate_ranges = list(set(candidate_ranges))
     candidate_ranges = [(s, e) for s, e in candidate_ranges if e - s <= block_size and e - s >= 2]
     
-    # Select top candidates
+    # Select top candidates and collect hints for each
     selected = candidate_ranges[:max_candidates]
     centroid_hints = []
-    if triangles is not None and prioritized_ranges:
-        centroid_hints = [prioritized_ranges[i][2] for i in range(min(len(prioritized_ranges), max_candidates))]
+    
+    if triangles is not None and candidate_scores:
+        # For each selected candidate, collect all relevant hint indices
+        for s, e in selected:
+            block_hints = []
+            # Collect hints from top candidates that overlap with this block
+            for score, indices, centroid_idx, source in candidate_scores[:max_candidates]:
+                # Check if this candidate's indices overlap with the block
+                if any(s <= idx < e for idx in indices):
+                    if centroid_idx not in block_hints:
+                        block_hints.append(centroid_idx)
+            centroid_hints.append(block_hints)
+    
+    # Ensure we have hints for all selected blocks
+    while len(centroid_hints) < len(selected):
+        centroid_hints.append([])
     
     return selected if selected else [(0, min(block_size, n))], centroid_hints
 
@@ -409,8 +447,10 @@ def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10,
 
             # DIVINE: Use the Oracle to find shortest vector
             # The Oracle uses staged expansion for blocks >= 4 to reveal hidden structure
+            block_hints = centroid_hints[blocks_processed - 1] if blocks_processed - 1 < len(centroid_hints) else []
             shortest_vector, shortest_norm = _geometric_svp_oracle(
-                block, N, num_passes, block_len, verbose=(verbose and blocks_processed <= 3)
+                block, N, num_passes, block_len, verbose=(verbose and blocks_processed <= 3),
+                centroid_hints=block_hints
             )
             
             # Check if this is shorter than current first vector in block
@@ -483,7 +523,7 @@ def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10,
 
 
 def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int, 
-                          verbose: bool = False, centroid_hint: int = -1):
+                          verbose: bool = False, centroid_hints: List[int] = None):
     """
     Geometric SVP Oracle - TRUE DIVINATION MODE.
     
@@ -536,14 +576,21 @@ def _geometric_svp_oracle(block_basis, N: int, num_passes: int, block_len: int,
                 shortest_norm = norm
                 shortest_idx = i
         
-        # If centroid hint provided, check if hinted index has a competitive vector
-        if centroid_hint >= 0 and centroid_hint < len(reduced_block):
-            hint_norm = _vector_norm_sq(reduced_block[centroid_hint])
-            if hint_norm > 0 and hint_norm <= shortest_norm * 1.1:  # Within 10% of shortest
-                shortest_idx = centroid_hint
-                shortest_norm = hint_norm
+        # If centroid hints provided, check if any hinted index has a competitive vector
+        if centroid_hints:
+            best_hint_idx = -1
+            best_hint_norm = shortest_norm
+            for hint in centroid_hints:
+                if hint >= 0 and hint < len(reduced_block):
+                    hint_norm = _vector_norm_sq(reduced_block[hint])
+                    if hint_norm > 0 and hint_norm <= best_hint_norm * 1.1:  # Within 10% of current best
+                        best_hint_idx = hint
+                        best_hint_norm = hint_norm
+            if best_hint_idx >= 0:
+                shortest_idx = best_hint_idx
+                shortest_norm = best_hint_norm
                 if verbose:
-                    print(f"[Oracle] Using centroid-hinted vector at index {centroid_hint}")
+                    print(f"[Oracle] Using centroid-hinted vector at index {best_hint_idx} from {len(centroid_hints)} hints")
         
         if verbose:
             bits = shortest_norm.bit_length() // 2 if shortest_norm > 0 else 0
