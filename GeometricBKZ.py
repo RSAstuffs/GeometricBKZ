@@ -522,6 +522,91 @@ def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10,
     return best_basis
 
 
+def _drag_single_plane_through_square(expanded_vertices, current_norm_sq, verbose=False):
+    """
+    Drag a single plane through the expanded square.
+
+    The plane moves through the vertex cloud, and we measure which lattice point
+    causes the least "resistance" or "distortion" to the plane's motion.
+
+    The planted vector is the one that allows the plane to pass through most smoothly.
+    """
+    if len(expanded_vertices) < 4:
+        return None, None
+
+    # Extract vertex coordinates
+    vertices = np.array([v[0] for v in expanded_vertices])
+
+    # Define the sweeping plane: a hyperplane perpendicular to the first coordinate
+    plane_normal = np.zeros(vertices.shape[1])
+    plane_normal[0] = 1.0  # Sweep along x_0 direction
+
+    # Get projections onto the normal
+    projections = vertices.dot(plane_normal)
+    sorted_indices = np.argsort(projections)
+    sorted_projections = projections[sorted_indices]
+
+    # The plane will "drag" through the points in order of their projection
+    # We measure how much each point disrupts the smooth motion of the plane
+
+    vertex_smoothness = {}
+
+    # For each vertex, measure how smoothly the plane can pass through it
+    for i, vertex_idx in enumerate(sorted_indices):
+        vertex = vertices[vertex_idx]
+
+        # Calculate "smoothness" - how well this vertex fits the local plane structure
+        # Vertices that are "planted-like" should cause less disruption
+
+        local_smoothness = 0.0
+        neighbor_count = 0
+
+        # Check neighboring vertices in projection order
+        for offset in [-2, -1, 1, 2]:
+            neighbor_idx = i + offset
+            if 0 <= neighbor_idx < len(sorted_indices) and neighbor_idx != i:
+                neighbor_vertex = vertices[sorted_indices[neighbor_idx]]
+
+                # Measure geometric relationship - planted vectors should have
+                # more regular relationships with neighbors
+                diff = vertex - neighbor_vertex
+                diff_norm = np.linalg.norm(diff)
+
+                if diff_norm > 1e-10:
+                    # Normalize the difference vector
+                    diff_unit = diff / diff_norm
+
+                    # Measure alignment with the sweeping direction
+                    alignment = abs(diff_unit.dot(plane_normal))
+
+                    # Planted vectors tend to have more regular alignments
+                    smoothness_contribution = 1.0 / (1.0 + abs(alignment - 0.5))  # Prefer moderate alignment
+                    local_smoothness += smoothness_contribution
+                    neighbor_count += 1
+
+        if neighbor_count > 0:
+            vertex_smoothness[vertex_idx] = local_smoothness / neighbor_count
+        else:
+            vertex_smoothness[vertex_idx] = 0.5  # Neutral smoothness
+
+    # Find the vertex with maximum smoothness (least distortion)
+    if vertex_smoothness:
+        smoothest_vertex_idx = max(vertex_smoothness.keys(), key=lambda k: vertex_smoothness[k])
+        smoothness_score = vertex_smoothness[smoothest_vertex_idx]
+        smoothest_vertex = vertices[smoothest_vertex_idx]
+
+        # Only consider it planted if it's significantly smoother than average
+        avg_smoothness = sum(vertex_smoothness.values()) / len(vertex_smoothness)
+        if smoothness_score > avg_smoothness * 1.5:  # At least 50% smoother than average
+            vector_norm = _vector_norm_sq(smoothest_vertex.astype(object))
+            if vector_norm > 0 and vector_norm < current_norm_sq:
+                if verbose:
+                    print(f"[PlaneSweep] Found smoothest vertex (smoothness: {smoothness_score:.3f} vs avg {avg_smoothness:.3f})")
+                return smoothest_vertex.astype(object), vector_norm
+
+    return None, None
+
+
 def _expand_square_for_distortion(block_basis, current_norm_sq: int, max_expansion: int = 8,
                                 verbose: bool = False) -> Tuple[Optional[np.ndarray], Optional[int]]:
     """
@@ -592,56 +677,24 @@ def _expand_square_for_distortion(block_basis, current_norm_sq: int, max_expansi
         if not new_vertices:
             continue
 
-        # Analyze distortions with multiple criteria
+        # Drag a single plane through the expanded square - the least distorted point is the planted vector
         all_vertices = base_vertices + new_vertices
 
-        # Compute distances from centroid using multiple projections
-        distances = []
-        for vertex, coeffs in all_vertices:
-            # Use multiple projections for better distortion detection
-            dist_sum = 0
-            for dim_start in range(0, min(6, block.shape[1]), 2):
-                dim_end = min(dim_start + 3, block.shape[1])
-                vertex_proj = np.array(vertex[dim_start:dim_end], dtype=float)
-                centroid_proj = np.array(centroid[dim_start:dim_end], dtype=float)
-                dist_sum += np.linalg.norm(vertex_proj - centroid_proj)
+        if verbose:
+            print(f"[Distortion] Level {expansion_level}: {len(all_vertices)} total vertices")
 
-            avg_dist = dist_sum / max(1, min(6, block.shape[1]) // 2)
-            distances.append((avg_dist, vertex, coeffs))
+        if expansion_level >= 3 and len(all_vertices) >= 4:  # Need sufficient expansion and vertices
+            if verbose:
+                print(f"[Distortion] Activating plane sweep at level {expansion_level} with {len(all_vertices)} vertices")
+            planted_vector, planted_norm = _drag_single_plane_through_square(
+                all_vertices, current_norm_sq, verbose=verbose
+            )
 
-        distances.sort(key=lambda x: x[0])  # Sort by distance from centroid
-
-        # More aggressive distortion detection
-        if len(distances) >= 5:
-            # Use multiple thresholds for finding distortions
-            percentiles = [10, 25, 50]  # 10th, 25th, 50th percentiles
-            percentile_values = np.percentile([d[0] for d in distances], percentiles)
-
-            for threshold_mult in [0.1, 0.2, 0.3, 0.5]:  # Multiple threshold multipliers
-                for dist, vertex, coeffs in distances:
-                    # Check against multiple percentiles
-                    is_distorted = False
-                    for p_val in percentile_values:
-                        if dist < p_val * threshold_mult:
-                            is_distorted = True
-                            break
-
-                    if is_distorted:
-                        # This vertex represents a potential short vector combination
-                        candidate_vector = vertex.copy()
-
-                        # Compute its norm
-                        norm_sq = _vector_norm_sq(candidate_vector)
-
-                        # More aggressive acceptance: accept if significantly better
-                        improvement_ratio = current_norm_sq / max(norm_sq, 1)
-                        if norm_sq > 0 and (improvement_ratio > 1.1 or norm_sq < current_norm_sq * 0.8):
-                            if verbose:
-                                bits = norm_sq.bit_length() // 2
-                                print(f"[Distortion] Found distorted vertex at level {expansion_level}: ~2^{bits} bits")
-                                print(f"[Distortion] Coefficients: {coeffs[:min(8, len(coeffs))]}")
-                                print(f"[Distortion] Improvement ratio: {improvement_ratio:.2f}")
-                            return candidate_vector, norm_sq
+            if planted_vector is not None:
+                if verbose:
+                    bits = planted_norm.bit_length() // 2
+                    print(f"[PlaneDrag] Found planted vector via single plane sweep at level {expansion_level}: ~2^{bits} bits")
+                return planted_vector, planted_norm
 
         if verbose and expansion_level % 2 == 0:
             print(f"[Distortion] Expansion level {expansion_level}: checked {len(new_vertices)} new vertices")
