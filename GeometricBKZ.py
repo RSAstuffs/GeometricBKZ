@@ -524,85 +524,114 @@ def bkz_reduce(basis: np.ndarray, block_size: int = 20, max_tours: int = 10,
 
 def _drag_single_plane_through_square(expanded_vertices, current_norm_sq, verbose=False):
     """
-    Drag a single plane through the expanded square.
+    Detect curvature in the expanded square vertex distribution.
 
-    The plane moves through the vertex cloud, and we measure which lattice point
-    causes the least "resistance" or "distortion" to the plane's motion.
+    Instead of dragging a flat plane, measure the local curvature of the vertex cloud.
+    Planted vectors create regions of high curvature where the lattice "bends" around them.
 
-    The planted vector is the one that allows the plane to pass through most smoothly.
+    The point causing maximum curvature reveals the planted vector.
     """
-    if len(expanded_vertices) < 4:
+    if len(expanded_vertices) < 6:  # Need more points for curvature estimation
         return None, None
 
     # Extract vertex coordinates
     vertices = np.array([v[0] for v in expanded_vertices])
 
-    # Define the sweeping plane: a hyperplane perpendicular to the first coordinate
-    plane_normal = np.zeros(vertices.shape[1])
-    plane_normal[0] = 1.0  # Sweep along x_0 direction
+    vertex_curvature = {}
 
-    # Get projections onto the normal
-    projections = vertices.dot(plane_normal)
-    sorted_indices = np.argsort(projections)
-    sorted_projections = projections[sorted_indices]
+    # For each vertex, estimate local curvature using neighboring points
+    for i, vertex in enumerate(vertices):
+        # Find k-nearest neighbors for curvature estimation
+        distances = [np.linalg.norm(vertex - other) for j, other in enumerate(vertices) if j != i]
+        sorted_distances = sorted(distances)
 
-    # The plane will "drag" through the points in order of their projection
-    # We measure how much each point disrupts the smooth motion of the plane
+        # Use 3-5 nearest neighbors for local surface fitting
+        k = min(5, len(sorted_distances))
+        neighbor_indices = []
+        neighbor_distances = sorted_distances[:k]
 
-    vertex_smoothness = {}
+        # Get indices of k nearest neighbors
+        for dist in neighbor_distances:
+            for j, other in enumerate(vertices):
+                if j != i and np.linalg.norm(vertex - other) == dist:
+                    if j not in neighbor_indices:
+                        neighbor_indices.append(j)
+                        break
 
-    # For each vertex, measure how smoothly the plane can pass through it
-    for i, vertex_idx in enumerate(sorted_indices):
-        vertex = vertices[vertex_idx]
+        if len(neighbor_indices) >= 3:
+            # Fit a local quadratic surface to estimate curvature
+            neighbors = vertices[neighbor_indices[:min(5, len(neighbor_indices))]]
 
-        # Calculate "smoothness" - how well this vertex fits the local plane structure
-        # Vertices that are "planted-like" should cause less disruption
+            # Center the points around the vertex
+            centered_neighbors = neighbors - vertex
 
-        local_smoothness = 0.0
-        neighbor_count = 0
+            try:
+                # Estimate local curvature using the variance of distances
+                # Higher variance in neighbor distances indicates higher curvature
+                neighbor_distances_from_center = [np.linalg.norm(n) for n in centered_neighbors]
 
-        # Check neighboring vertices in projection order
-        for offset in [-2, -1, 1, 2]:
-            neighbor_idx = i + offset
-            if 0 <= neighbor_idx < len(sorted_indices) and neighbor_idx != i:
-                neighbor_vertex = vertices[sorted_indices[neighbor_idx]]
+                if neighbor_distances_from_center:
+                    # Curvature measure: coefficient of variation of neighbor distances
+                    mean_dist = np.mean(neighbor_distances_from_center)
+                    std_dist = np.std(neighbor_distances_from_center)
 
-                # Measure geometric relationship - planted vectors should have
-                # more regular relationships with neighbors
-                diff = vertex - neighbor_vertex
-                diff_norm = np.linalg.norm(diff)
+                    if mean_dist > 1e-10:
+                        curvature = std_dist / mean_dist  # Coefficient of variation
+                    else:
+                        curvature = 0.0
 
-                if diff_norm > 1e-10:
-                    # Normalize the difference vector
-                    diff_unit = diff / diff_norm
+                    # Also measure angular dispersion (how spread out directions are)
+                    directions = [n / np.linalg.norm(n) for n in centered_neighbors if np.linalg.norm(n) > 1e-10]
+                    if len(directions) >= 2:
+                        # Average dot product between direction pairs
+                        dot_products = []
+                        for a in range(len(directions)):
+                            for b in range(a+1, len(directions)):
+                                dot_products.append(abs(np.dot(directions[a], directions[b])))
 
-                    # Measure alignment with the sweeping direction
-                    alignment = abs(diff_unit.dot(plane_normal))
+                        angular_dispersion = 1.0 - np.mean(dot_products) if dot_products else 0.0
 
-                    # Planted vectors tend to have more regular alignments
-                    smoothness_contribution = 1.0 / (1.0 + abs(alignment - 0.5))  # Prefer moderate alignment
-                    local_smoothness += smoothness_contribution
-                    neighbor_count += 1
+                        # Combined curvature measure
+                        total_curvature = curvature + angular_dispersion * 0.5
+                        vertex_curvature[i] = total_curvature
+                    else:
+                        vertex_curvature[i] = curvature
+                else:
+                    vertex_curvature[i] = 0.0
 
-        if neighbor_count > 0:
-            vertex_smoothness[vertex_idx] = local_smoothness / neighbor_count
-        else:
-            vertex_smoothness[vertex_idx] = 0.5  # Neutral smoothness
-
-    # Find the vertex with maximum smoothness (least distortion)
-    if vertex_smoothness:
-        smoothest_vertex_idx = max(vertex_smoothness.keys(), key=lambda k: vertex_smoothness[k])
-        smoothness_score = vertex_smoothness[smoothest_vertex_idx]
-        smoothest_vertex = vertices[smoothest_vertex_idx]
-
-        # Only consider it planted if it's significantly smoother than average
-        avg_smoothness = sum(vertex_smoothness.values()) / len(vertex_smoothness)
-        if smoothness_score > avg_smoothness * 1.5:  # At least 50% smoother than average
-            vector_norm = _vector_norm_sq(smoothest_vertex.astype(object))
-            if vector_norm > 0 and vector_norm < current_norm_sq:
+            except Exception as e:
                 if verbose:
-                    print(f"[PlaneSweep] Found smoothest vertex (smoothness: {smoothness_score:.3f} vs avg {avg_smoothness:.3f})")
-                return smoothest_vertex.astype(object), vector_norm
+                    print(f"[Curvature] Failed to compute for vertex {i}: {e}")
+                vertex_curvature[i] = 0.0
+        else:
+            vertex_curvature[i] = 0.0
+
+    # Find the vertex with maximum curvature (most likely planted)
+    if vertex_curvature:
+        # Sort by curvature (highest first)
+        sorted_by_curvature = sorted(vertex_curvature.items(), key=lambda x: x[1], reverse=True)
+        top_candidates = sorted_by_curvature[:min(3, len(sorted_by_curvature))]
+
+        avg_curvature = sum(vertex_curvature.values()) / len(vertex_curvature)
+
+        for vertex_idx, curvature_score in top_candidates:
+            curved_vertex = vertices[vertex_idx]
+
+            # Much less sensitive: require extremely high curvature (planted vectors create massive curvature)
+            is_extreme_curvature = (
+                curvature_score > avg_curvature * 5.0 and  # 5x more curved than average (was 1.5x)
+                curvature_score > 2.0  # Extremely high absolute curvature (was 0.3)
+            )
+
+            if is_extreme_curvature:
+                vector_norm = _vector_norm_sq(curved_vertex.astype(object))
+                improvement_ratio = current_norm_sq / max(vector_norm, 1)
+
+                # Much more restrictive improvement requirement
+                if vector_norm > 0 and improvement_ratio > 2.0:  # Require 2x improvement (was 1.05x)
+                    if verbose:
+                        print(f"[Curvature] Found extreme-curvature vertex (curvature: {curvature_score:.3f} vs avg {avg_curvature:.3f}, ratio: {improvement_ratio:.2f})")
+                    return curved_vertex.astype(object), vector_norm
 
     return None, None
 
